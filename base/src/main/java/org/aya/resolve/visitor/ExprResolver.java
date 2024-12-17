@@ -16,6 +16,7 @@ import org.aya.resolve.context.NoExportContext;
 import org.aya.resolve.error.GeneralizedNotAvailableError;
 import org.aya.syntax.concrete.Expr;
 import org.aya.syntax.concrete.Pattern;
+import org.aya.syntax.concrete.stmt.Generalize;
 import org.aya.syntax.concrete.stmt.QualifiedID;
 import org.aya.syntax.concrete.stmt.Stmt;
 import org.aya.syntax.concrete.stmt.decl.DataCon;
@@ -142,6 +143,7 @@ public record ExprResolver(
               // Ordered set semantics. Do not expect too many generalized vars.
               var owner = generalized.owner;
               assert owner != null : "Sanity check";
+              introduceDependencies(generalized);
               var param = owner.toExpr(false, generalized.toLocal());
               allowedGeneralizes.put(generalized, param);
               addReference(owner);
@@ -255,11 +257,55 @@ public record ExprResolver(
     });
   }
 
+  // Helper method to introduce dependencies
+  private void introduceDependencies(@NotNull GeneralizedVar var) {
+    // Check if the variable has already been introduced
+    if (allowedGeneralizes.containsKey(var)) return;
+
+    // Introduce dependencies first
+    var dependencies = getDependencies(var);
+    for (var dep : dependencies) {
+      introduceDependencies(dep);
+    }
+
+    // Introduce the variable
+    var owner = var.owner;
+    assert owner != null : "GeneralizedVar owner should not be null";
+    var param = owner.toExpr(false, var.toLocal());
+    allowedGeneralizes.put(var, param);
+    addReference(owner);
+  }
+
+  // Method to extract dependencies from the variable's type
+  private @NotNull ImmutableSeq<GeneralizedVar> getDependencies(@NotNull GeneralizedVar var) {
+    // Traverse the type expression and collect GeneralizedVars
+    var collector = new GeneralizedVarCollector();
+    var.owner.type.descent(collector);
+    return collector.getCollected();
+  }
+
+  // A helper class to collect GeneralizedVars from an Expr
+  private static class GeneralizedVarCollector implements PosedUnaryOperator<Expr> {
+    private final MutableList<GeneralizedVar> collected = MutableList.create();
+
+    @Override
+    public @NotNull Expr apply(@NotNull SourcePos pos, @NotNull Expr expr) {
+      if (expr instanceof Expr.Ref ref && ref.var() instanceof GeneralizedVar gvar) {
+        collected.append(gvar);
+      }
+      return expr.descent(this);
+    }
+
+    public ImmutableSeq<GeneralizedVar> getCollected() {
+      return collected.toImmutableSeq();
+    }
+  }
   public @NotNull AnyVar resolve(@NotNull QualifiedID name) {
     var result = ctx.get(name);
     if (result instanceof GeneralizedVar gvar) {
-      var gened = allowedGeneralizes.getOrNull(gvar);
-      if (gened != null) return gened.ref();
+      introduceDependencies(gvar);
+      var param = allowedGeneralizes.getOrNull(gvar);
+      if (param != null) return param.ref();
     }
 
     return result;
@@ -286,4 +332,27 @@ public record ExprResolver(
     FnBody
   }
   public record Options(boolean allowIntroduceGeneralized) { }
+
+  public void resolveGeneralizes(@NotNull Generalize generalizeStmt) {
+    var variables = generalizeStmt.variables;
+    var mCtx = MutableValue.create(ctx);
+
+    // Create a new ExprResolver for processing variables
+    var resolver = enter(mCtx.get());
+    resolver.enter(Where.Head);
+
+    // Process each variable sequentially
+    for (var variable : variables) {
+      // Resolve the type expression
+      generalizeStmt.type = generalizeStmt.type.descent(resolver);
+
+      // Update the context with the new variable
+      mCtx.set(mCtx.get().bind(variable.toLocal()));
+
+      // Update the resolver with the new context
+      resolver = resolver.enter(mCtx.get());
+    }
+
+    resolver.exit();
+  }
 }
